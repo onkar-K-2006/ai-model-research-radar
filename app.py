@@ -12,17 +12,41 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 
-# Import Dataflow SDK and database utility
-from dataflow.dataflow import Dataflow
-from radar_db import (
-    CONN_ID,
-    init_database,
-    sync_all_data,
+# Safe Dataflow SDK import with fallback guard
+try:
+    from dataflow.dataflow import Dataflow
+    dataflow = Dataflow()
+except Exception:
+    class _FallbackDataflow:
+        def variable(self, name: str):
+            return None
+        def secret(self, name: str):
+            return None
+        def variable_or_secret(self, key: str):
+            return None
+    dataflow = _FallbackDataflow()
 
-    get_models_dataframe,
-    get_arxiv_dataframe,
-    get_radar_summary,
-)
+# Safe database utilities import
+try:
+    from radar_db import (
+        CONN_ID,
+        init_database,
+        sync_all_data,
+        get_models_dataframe,
+        get_arxiv_dataframe,
+        get_radar_summary,
+    )
+except ImportError:
+    # Ensure current directory is in sys.path if invoked from another working directory
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from radar_db import (
+        CONN_ID,
+        init_database,
+        sync_all_data,
+        get_models_dataframe,
+        get_arxiv_dataframe,
+        get_radar_summary,
+    )
 
 # Page Configuration
 st.set_page_config(
@@ -89,11 +113,14 @@ st.markdown("""
 # Initialize and seed database if empty
 @st.cache_resource
 def setup_app_db():
-    init_database(CONN_ID)
-    summary = get_radar_summary(CONN_ID)
-    if summary["total_models"] == 0 or summary["total_papers"] == 0:
-        sync_all_data(CONN_ID)
-    return True
+    try:
+        init_database(CONN_ID)
+        summary = get_radar_summary(CONN_ID)
+        if summary.get("total_models", 0) == 0 or summary.get("total_papers", 0) == 0:
+            sync_all_data(CONN_ID)
+        return True
+    except Exception as e:
+        return False
 
 setup_app_db()
 
@@ -107,7 +134,7 @@ with st.sidebar:
     if st.button("🚀 Run Live Data Ingestion", use_container_width=True, type="primary"):
         with st.spinner("Fetching latest Hugging Face models & arXiv papers..."):
             res = sync_all_data(CONN_ID)
-            st.success(f"Synced {res['models_synced']} models & {res['papers_synced']} papers!")
+            st.success(f"Synced {res.get('models_synced', 0)} models & {res.get('papers_synced', 0)} papers!")
             st.rerun()
 
     st.markdown("---")
@@ -119,7 +146,7 @@ with st.sidebar:
     )
     
     summary_data = get_radar_summary(CONN_ID)
-    st.markdown(f"**Last Database Update:**\n`{summary_data['last_sync']}`")
+    st.markdown(f"**Last Database Update:**\n`{summary_data.get('last_sync', 'Never')}`")
 
 # Header section
 st.markdown("<div class='main-header'>📡 AI Model & Research Radar</div>", unsafe_allow_html=True)
@@ -132,17 +159,22 @@ st.markdown(
 summary = get_radar_summary(CONN_ID)
 col1, col2, col3, col4 = st.columns(4)
 
+total_models = summary.get("total_models", 0)
+total_downloads = summary.get("total_downloads", 0)
+total_likes = summary.get("total_likes", 0)
+total_papers = summary.get("total_papers", 0)
+
 with col1:
-    st.metric(label="🔥 Tracked Top Models", value=f"{summary['total_models']:,}")
+    st.metric(label="🔥 Tracked Top Models", value=f"{total_models:,}")
 
 with col2:
-    st.metric(label="📥 Total Model Downloads", value=f"{summary['total_downloads'] / 1_000_000:.2f}M" if summary['total_downloads'] > 0 else "0")
+    st.metric(label="📥 Total Model Downloads", value=f"{total_downloads / 1_000_000:.2f}M" if total_downloads > 0 else "0")
 
 with col3:
-    st.metric(label="❤️ Total Model Likes", value=f"{summary['total_likes']:,}")
+    st.metric(label="❤️ Total Model Likes", value=f"{total_likes:,}")
 
 with col4:
-    st.metric(label="📜 Curated arXiv Papers", value=f"{summary['total_papers']:,}")
+    st.metric(label="📜 Curated arXiv Papers", value=f"{total_papers:,}")
 
 st.markdown("---")
 

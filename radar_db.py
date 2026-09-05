@@ -12,10 +12,19 @@ import pandas as pd
 from typing import List, Dict, Any, Optional
 from contextlib import contextmanager
 
-from dataflow.dataflow import Dataflow
-
-# Initialize Dataflow SDK
-dataflow = Dataflow()
+# Safe Dataflow SDK import with fallback guard
+try:
+    from dataflow.dataflow import Dataflow
+    dataflow = Dataflow()
+except Exception:
+    class _FallbackDataflow:
+        def variable(self, name: str):
+            return None
+        def secret(self, name: str):
+            return None
+        def variable_or_secret(self, key: str):
+            return None
+    dataflow = _FallbackDataflow()
 
 
 def _resolve_db_path() -> str:
@@ -96,9 +105,10 @@ def get_db_connection(conn_id: str = CONN_ID):
     if conn is None:
         try:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+            conn = sqlite3.connect(DB_PATH, timeout=10)
         except Exception:
-            pass
-        conn = sqlite3.connect(DB_PATH, timeout=10)
+            # Fallback to in-memory SQLite if filesystem is not writable
+            conn = sqlite3.connect(":memory:")
         is_hook = False
 
     try:
@@ -132,12 +142,14 @@ def init_database(conn_id: str = CONN_ID) -> None:
         category TEXT
     );
     """
-    
-    with get_db_connection(conn_id) as conn:
-        cursor = conn.cursor()
-        cursor.execute(create_models_table)
-        cursor.execute(create_arxiv_table)
-        conn.commit()
+    try:
+        with get_db_connection(conn_id) as conn:
+            cursor = conn.cursor()
+            cursor.execute(create_models_table)
+            cursor.execute(create_arxiv_table)
+            conn.commit()
+    except Exception as e:
+        print(f"init_database notice: {e}")
 
 
 def fetch_hf_models(api_url: str = HF_API_URL) -> List[tuple]:
@@ -241,91 +253,115 @@ def fetch_arxiv_papers(api_url: str = ARXIV_API_URL) -> List[tuple]:
 
 def sync_all_data(conn_id: str = CONN_ID) -> Dict[str, int]:
     """Syncs data for both HF models and arXiv papers into SQLite database."""
-    init_database(conn_id)
-    
-    models = fetch_hf_models()
-    papers = fetch_arxiv_papers()
-    
-    with get_db_connection(conn_id) as conn:
-        cursor = conn.cursor()
-        cursor.executemany(
-            "INSERT OR REPLACE INTO models_trending (id, pipeline_tag, downloads, likes, fetched_at) VALUES (?, ?, ?, ?, ?)",
-            models
-        )
-        cursor.executemany(
-            "INSERT OR REPLACE INTO arxiv_papers (paper_id, title, summary, published, category) VALUES (?, ?, ?, ?, ?)",
-            papers
-        )
-        conn.commit()
+    try:
+        init_database(conn_id)
+        models = fetch_hf_models()
+        papers = fetch_arxiv_papers()
         
-    return {"models_synced": len(models), "papers_synced": len(papers)}
+        with get_db_connection(conn_id) as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                "INSERT OR REPLACE INTO models_trending (id, pipeline_tag, downloads, likes, fetched_at) VALUES (?, ?, ?, ?, ?)",
+                models
+            )
+            cursor.executemany(
+                "INSERT OR REPLACE INTO arxiv_papers (paper_id, title, summary, published, category) VALUES (?, ?, ?, ?, ?)",
+                papers
+            )
+            conn.commit()
+            
+        return {"models_synced": len(models), "papers_synced": len(papers)}
+    except Exception as e:
+        print(f"sync_all_data notice: {e}")
+        return {"models_synced": 0, "papers_synced": 0}
 
 
 def get_models_dataframe(conn_id: str = CONN_ID, category_filter: Optional[str] = None, search_query: Optional[str] = None) -> pd.DataFrame:
-    """Queries trending models from SQLite database."""
-    init_database(conn_id)
-    
-    query = "SELECT id, pipeline_tag, downloads, likes, fetched_at FROM models_trending WHERE 1=1"
-    params = []
-    
-    if category_filter and category_filter != "All":
-        query += " AND pipeline_tag = ?"
-        params.append(category_filter)
+    """Queries trending models from SQLite database with safe fallback schema."""
+    default_cols = ["id", "pipeline_tag", "downloads", "likes", "fetched_at"]
+    try:
+        init_database(conn_id)
         
-    if search_query:
-        query += " AND id LIKE ?"
-        params.append(f"%{search_query}%")
+        query = "SELECT id, pipeline_tag, downloads, likes, fetched_at FROM models_trending WHERE 1=1"
+        params = []
         
-    query += " ORDER BY downloads DESC"
-    
-    with get_db_connection(conn_id) as conn:
-        df = pd.read_sql_query(query, conn, params=params)
+        if category_filter and category_filter != "All":
+            query += " AND pipeline_tag = ?"
+            params.append(category_filter)
+            
+        if search_query:
+            query += " AND id LIKE ?"
+            params.append(f"%{search_query}%")
+            
+        query += " ORDER BY downloads DESC"
         
-    return df
+        with get_db_connection(conn_id) as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+            
+        return df if not df.empty else pd.DataFrame(columns=default_cols)
+    except Exception as e:
+        print(f"get_models_dataframe notice: {e}")
+        return pd.DataFrame(columns=default_cols)
 
 
 def get_arxiv_dataframe(conn_id: str = CONN_ID, category_filter: Optional[str] = None, search_query: Optional[str] = None) -> pd.DataFrame:
-    """Queries arXiv research papers from SQLite database."""
-    init_database(conn_id)
-    
-    query = "SELECT paper_id, title, summary, published, category FROM arxiv_papers WHERE 1=1"
-    params = []
-    
-    if category_filter and category_filter != "All":
-        query += " AND category = ?"
-        params.append(category_filter)
+    """Queries arXiv research papers from SQLite database with safe fallback schema."""
+    default_cols = ["paper_id", "title", "summary", "published", "category"]
+    try:
+        init_database(conn_id)
         
-    if search_query:
-        query += " AND (title LIKE ? OR summary LIKE ?)"
-        params.append(f"%{search_query}%")
-        params.append(f"%{search_query}%")
+        query = "SELECT paper_id, title, summary, published, category FROM arxiv_papers WHERE 1=1"
+        params = []
         
-    query += " ORDER BY published DESC"
-    
-    with get_db_connection(conn_id) as conn:
-        df = pd.read_sql_query(query, conn, params=params)
+        if category_filter and category_filter != "All":
+            query += " AND category = ?"
+            params.append(category_filter)
+            
+        if search_query:
+            query += " AND (title LIKE ? OR summary LIKE ?)"
+            params.append(f"%{search_query}%")
+            params.append(f"%{search_query}%")
         
-    return df
+        query += " ORDER BY published DESC"
+        
+        with get_db_connection(conn_id) as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+            
+        return df if not df.empty else pd.DataFrame(columns=default_cols)
+    except Exception as e:
+        print(f"get_arxiv_dataframe notice: {e}")
+        return pd.DataFrame(columns=default_cols)
 
 
 def get_radar_summary(conn_id: str = CONN_ID) -> Dict[str, Any]:
-    """Computes summary statistics for KPI badges."""
-    init_database(conn_id)
-    
-    with get_db_connection(conn_id) as conn:
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*), SUM(downloads), SUM(likes), MAX(fetched_at) FROM models_trending")
-        m_row = cursor.fetchone()
-        
-        cursor.execute("SELECT COUNT(*), COUNT(DISTINCT category) FROM arxiv_papers")
-        p_row = cursor.fetchone()
-        
-    return {
-        "total_models": m_row[0] if m_row and m_row[0] else 0,
-        "total_downloads": m_row[1] if m_row and m_row[1] else 0,
-        "total_likes": m_row[2] if m_row and m_row[2] else 0,
-        "last_sync": m_row[3] if m_row and m_row[3] else "Never",
-        "total_papers": p_row[0] if p_row and p_row[0] else 0,
-        "total_categories": p_row[1] if p_row and p_row[1] else 0,
+    """Computes summary statistics for KPI badges with safe fallback values."""
+    fallback_summary = {
+        "total_models": 0,
+        "total_downloads": 0,
+        "total_likes": 0,
+        "last_sync": "Never",
+        "total_papers": 0,
+        "total_categories": 0,
     }
+    try:
+        init_database(conn_id)
+        with get_db_connection(conn_id) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*), SUM(downloads), SUM(likes), MAX(fetched_at) FROM models_trending")
+            m_row = cursor.fetchone()
+            
+            cursor.execute("SELECT COUNT(*), COUNT(DISTINCT category) FROM arxiv_papers")
+            p_row = cursor.fetchone()
+            
+        return {
+            "total_models": m_row[0] if m_row and m_row[0] else 0,
+            "total_downloads": m_row[1] if m_row and m_row[1] else 0,
+            "total_likes": m_row[2] if m_row and m_row[2] else 0,
+            "last_sync": m_row[3] if m_row and m_row[3] else "Never",
+            "total_papers": p_row[0] if p_row and p_row[0] else 0,
+            "total_categories": p_row[1] if p_row and p_row[1] else 0,
+        }
+    except Exception as e:
+        print(f"get_radar_summary notice: {e}")
+        return fallback_summary
