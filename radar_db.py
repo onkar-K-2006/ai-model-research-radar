@@ -1,33 +1,60 @@
 """
 Database access and synchronization module for AI Model & Research Radar.
-Uses Dataflow SDK for configurations and SqliteHook for database interaction.
+Uses Dataflow SDK for configurations and Airflow SqliteHook with graceful fallback to sqlite3.
 """
 
 import os
+import sqlite3
 import datetime
 import xml.etree.ElementTree as ET
 import requests
 import pandas as pd
 from typing import List, Dict, Any, Optional
+from contextlib import contextmanager
 
-from airflow.providers.sqlite.hooks.sqlite import SqliteHook
-from airflow.models import Connection
-from airflow.settings import Session
 from dataflow.dataflow import Dataflow
 
 # Initialize Dataflow SDK
 dataflow = Dataflow()
 
-DB_PATH = "/home/jovyan/shared/ai_radar.db"
+
+def _resolve_db_path() -> str:
+    """Resolves database file path, falling back to local directory if shared path is inaccessible."""
+    primary_dir = "/home/jovyan/shared"
+    primary_path = os.path.join(primary_dir, "ai_radar.db")
+    try:
+        os.makedirs(primary_dir, exist_ok=True)
+        # Verify write permissions
+        test_file = os.path.join(primary_dir, ".perm_check")
+        with open(test_file, "w") as f:
+            f.write("1")
+        if os.path.exists(test_file):
+            os.remove(test_file)
+        return primary_path
+    except Exception:
+        # Fallback to local project directory
+        local_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(local_dir, "ai_radar.db")
+
+
+DB_PATH = _resolve_db_path()
 CONN_ID = dataflow.variable("sqlite_conn_id") or "DATAFLOW_DB"
 HF_API_URL = dataflow.variable("hf_api_url") or "https://huggingface.co/api/models?sort=downloads&direction=-1&limit=25"
 ARXIV_API_URL = dataflow.variable("arxiv_api_url") or "http://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.CL+OR+cat:cs.CV&max_results=15&sortBy=submittedDate&sortOrder=descending"
 
 
-def ensure_sqlite_connection(conn_id: str = CONN_ID, db_path: str = DB_PATH) -> None:
-    """Ensures Airflow SQLite connection is configured for DATAFLOW_DB."""
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+def ensure_sqlite_connection(conn_id: str = CONN_ID, db_path: str = None) -> None:
+    """Ensures Airflow SQLite connection is configured when Airflow environment is present."""
+    if db_path is None:
+        db_path = DB_PATH
     try:
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        from airflow.models import Connection
+        from airflow.settings import Session
         session = Session()
         conn = session.query(Connection).filter(Connection.conn_id == conn_id).first()
         if not conn:
@@ -43,16 +70,49 @@ def ensure_sqlite_connection(conn_id: str = CONN_ID, db_path: str = DB_PATH) -> 
                 conn.host = db_path
                 session.commit()
         session.close()
-    except Exception as e:
-        # Non-critical if connection already configured in environment
+    except Exception:
+        # Standalone container without Airflow metadata DB
         pass
 
 
-def init_database(conn_id: str = CONN_ID) -> None:
-    """Initializes tables in the SQLite database via SqliteHook."""
-    ensure_sqlite_connection(conn_id)
-    hook = SqliteHook(sqlite_conn_id=conn_id)
+@contextmanager
+def get_db_connection(conn_id: str = CONN_ID):
+    """
+    Context manager that yields a database connection.
+    Attempts Airflow SqliteHook first, falling back gracefully to standard sqlite3.
+    """
+    ensure_sqlite_connection(conn_id, DB_PATH)
+    conn = None
+    is_hook = False
     
+    try:
+        from airflow.providers.sqlite.hooks.sqlite import SqliteHook
+        hook = SqliteHook(sqlite_conn_id=conn_id)
+        conn = hook.get_conn()
+        is_hook = True
+    except Exception:
+        conn = None
+
+    if conn is None:
+        try:
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        except Exception:
+            pass
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        is_hook = False
+
+    try:
+        yield conn
+    finally:
+        if not is_hook and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def init_database(conn_id: str = CONN_ID) -> None:
+    """Initializes tables in the SQLite database."""
     create_models_table = """
     CREATE TABLE IF NOT EXISTS models_trending (
         id TEXT PRIMARY KEY,
@@ -73,7 +133,7 @@ def init_database(conn_id: str = CONN_ID) -> None:
     );
     """
     
-    with hook.get_conn() as conn:
+    with get_db_connection(conn_id) as conn:
         cursor = conn.cursor()
         cursor.execute(create_models_table)
         cursor.execute(create_arxiv_table)
@@ -81,11 +141,11 @@ def init_database(conn_id: str = CONN_ID) -> None:
 
 
 def fetch_hf_models(api_url: str = HF_API_URL) -> List[tuple]:
-    """Fetches trending models from HuggingFace API."""
+    """Fetches trending models from HuggingFace API with quick timeout and offline fallback."""
     headers = {"User-Agent": "Dataflow-AI-Radar/1.0"}
     models = []
     try:
-        resp = requests.get(api_url, headers=headers, timeout=12)
+        resp = requests.get(api_url, headers=headers, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -98,7 +158,7 @@ def fetch_hf_models(api_url: str = HF_API_URL) -> List[tuple]:
                 likes = int(item.get("likes", 0) or 0)
                 models.append((m_id, tag, downloads, likes, now_str))
     except Exception as e:
-        print(f"HF API fetch error: {e}")
+        print(f"HF API fetch notice: {e}")
 
     if not models:
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -118,11 +178,11 @@ def fetch_hf_models(api_url: str = HF_API_URL) -> List[tuple]:
 
 
 def fetch_arxiv_papers(api_url: str = ARXIV_API_URL) -> List[tuple]:
-    """Fetches AI research papers from arXiv API."""
+    """Fetches AI research papers from arXiv API with quick timeout and offline fallback."""
     headers = {"User-Agent": "Dataflow-AI-Radar/1.0"}
     papers = []
     try:
-        resp = requests.get(api_url, headers=headers, timeout=15)
+        resp = requests.get(api_url, headers=headers, timeout=5)
         if resp.status_code == 200:
             root = ET.fromstring(resp.content)
             ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -149,7 +209,7 @@ def fetch_arxiv_papers(api_url: str = ARXIV_API_URL) -> List[tuple]:
                     
                 papers.append((paper_id, title, summary, published, category))
     except Exception as e:
-        print(f"arXiv API fetch error: {e}")
+        print(f"arXiv API fetch notice: {e}")
 
     if not papers:
         now_str = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -180,14 +240,13 @@ def fetch_arxiv_papers(api_url: str = ARXIV_API_URL) -> List[tuple]:
 
 
 def sync_all_data(conn_id: str = CONN_ID) -> Dict[str, int]:
-    """Syncs data for both HF models and arXiv papers into SQLite via SqliteHook."""
+    """Syncs data for both HF models and arXiv papers into SQLite database."""
     init_database(conn_id)
-    hook = SqliteHook(sqlite_conn_id=conn_id)
     
     models = fetch_hf_models()
     papers = fetch_arxiv_papers()
     
-    with hook.get_conn() as conn:
+    with get_db_connection(conn_id) as conn:
         cursor = conn.cursor()
         cursor.executemany(
             "INSERT OR REPLACE INTO models_trending (id, pipeline_tag, downloads, likes, fetched_at) VALUES (?, ?, ?, ?, ?)",
@@ -203,9 +262,8 @@ def sync_all_data(conn_id: str = CONN_ID) -> Dict[str, int]:
 
 
 def get_models_dataframe(conn_id: str = CONN_ID, category_filter: Optional[str] = None, search_query: Optional[str] = None) -> pd.DataFrame:
-    """Queries trending models from SQLite using SqliteHook."""
+    """Queries trending models from SQLite database."""
     init_database(conn_id)
-    hook = SqliteHook(sqlite_conn_id=conn_id)
     
     query = "SELECT id, pipeline_tag, downloads, likes, fetched_at FROM models_trending WHERE 1=1"
     params = []
@@ -220,16 +278,15 @@ def get_models_dataframe(conn_id: str = CONN_ID, category_filter: Optional[str] 
         
     query += " ORDER BY downloads DESC"
     
-    with hook.get_conn() as conn:
+    with get_db_connection(conn_id) as conn:
         df = pd.read_sql_query(query, conn, params=params)
         
     return df
 
 
 def get_arxiv_dataframe(conn_id: str = CONN_ID, category_filter: Optional[str] = None, search_query: Optional[str] = None) -> pd.DataFrame:
-    """Queries arXiv research papers from SQLite using SqliteHook."""
+    """Queries arXiv research papers from SQLite database."""
     init_database(conn_id)
-    hook = SqliteHook(sqlite_conn_id=conn_id)
     
     query = "SELECT paper_id, title, summary, published, category FROM arxiv_papers WHERE 1=1"
     params = []
@@ -245,7 +302,7 @@ def get_arxiv_dataframe(conn_id: str = CONN_ID, category_filter: Optional[str] =
         
     query += " ORDER BY published DESC"
     
-    with hook.get_conn() as conn:
+    with get_db_connection(conn_id) as conn:
         df = pd.read_sql_query(query, conn, params=params)
         
     return df
@@ -254,9 +311,8 @@ def get_arxiv_dataframe(conn_id: str = CONN_ID, category_filter: Optional[str] =
 def get_radar_summary(conn_id: str = CONN_ID) -> Dict[str, Any]:
     """Computes summary statistics for KPI badges."""
     init_database(conn_id)
-    hook = SqliteHook(sqlite_conn_id=conn_id)
     
-    with hook.get_conn() as conn:
+    with get_db_connection(conn_id) as conn:
         cursor = conn.cursor()
         
         cursor.execute("SELECT COUNT(*), SUM(downloads), SUM(likes), MAX(fetched_at) FROM models_trending")
